@@ -1,0 +1,219 @@
+library(quantmod)
+library(ghyp)
+library(copula)
+library(cubature)
+library(Rglpk)
+library(fBasics)
+library(PortfolioAnalytics)
+library(ROI)
+library(ROI.plugin.glpk)
+library(parallel)
+library(MASS)
+
+set.seed(123)
+
+
+symbols <- c("AAPL","NFLX","TSLA","MSFT",
+             "PFE","JPM","MS","F")
+
+get_returns <- function(sym, from = "2013-01-01", to = "2016-12-31") {
+  dat <- getSymbols(sym, src = "yahoo", from = from, to = to, auto.assign = FALSE)
+  prices <- Ad(dat)
+  dailyReturn(prices, type = "log")
+}
+
+returns_list <- lapply(symbols, get_returns)
+returns <- do.call(merge, returns_list)
+colnames(returns) <- symbols
+returns <- na.omit(returns)
+
+start_date <- as.Date("2015-12-31")
+start_index <- which(index(returns) == start_date)
+stopifnot(start_index >= 252)
+
+levy_nig_safe <- function(x, alpha, beta, delta, eps = 1e-10) {
+  x2 <- ifelse(abs(x) < eps, sign(x) * eps, x)
+  v <- delta * alpha / pi *
+    exp(beta * x2) *
+    besselK(alpha * abs(x2), 1, expon.scaled = TRUE) / abs(x2)
+  v[!is.finite(v)] <- 0
+  v
+}
+
+build_Uinv <- function(pars, x_min = 1e-5, x_max = 0.05, n_grid = 20000) {
+  gpos <- exp(seq(log(x_min), log(x_max), length.out = n_grid))
+  dpos <- levy_nig_safe(gpos, pars["alpha"], pars["beta"], pars["delta"])
+  tail_pos <- rev(cumsum(rev((dpos[-1]+dpos[-n_grid])/2 * diff(gpos))))
+  inv_pos <- approxfun(tail_pos, gpos[-1], method="linear", rule=2)
+  
+  gneg <- -rev(gpos)
+  dneg <- levy_nig_safe(gneg, pars["alpha"], pars["beta"], pars["delta"])
+  tail_neg <- cumsum((dneg[-1]+dneg[-n_grid])/2 * diff(gneg))
+  tail_neg <- -tail_neg
+  inv_neg <- approxfun(tail_neg, gneg[-1], method="linear", rule=2)
+  
+  function(u) {
+    tiny <- 1e-12
+    u <- ifelse(u >= 0, pmax(u, tiny), pmin(u, -tiny))
+    ifelse(u >= 0, inv_pos(u), inv_neg(u))
+  }
+}
+
+one_tail <- function(ax, side, alpha, beta, delta) {
+  f <- function(x) levy_nig_safe(x, alpha, beta, delta)
+  if (side == "pos")
+    hcubature(f, lowerLimit = ax, upperLimit = Inf)$integral
+  else
+    hcubature(f, lowerLimit = -Inf, upperLimit = -ax)$integral
+}
+
+select_optimal_tau <- function(nig_marg, Uinv_list, tau_grid = seq(10, 200, by = 10), eps_target = 0.01, method = c("mean", "max")) {
+  method <- match.arg(method)
+  
+  compute_Aj <- function(pars, f_Uinv, tau) {
+    epsilon <- abs(f_Uinv(tau))
+    f <- function(x) x * levy_nig_safe(x, pars["alpha"], pars["beta"], pars["delta"])
+    A_pos <- hcubature(f, lowerLimit = 1e-10, upperLimit = epsilon)$integral
+    A_neg <- hcubature(f, lowerLimit = -epsilon, upperLimit = -1e-10)$integral
+    A_pos + A_neg
+  }
+  
+  error_vals <- sapply(tau_grid, function(tau) {
+    A_vals <- mapply(compute_Aj, nig_marg, Uinv_list, MoreArgs = list(tau = tau))
+    if (method == "mean") mean(A_vals) else max(A_vals)
+  })
+  
+  if (all(error_vals > eps_target)) {
+    warning("No tau satisfies the error threshold. Returning largest tau.")
+    return(tau_grid[which.min(error_vals)])
+  }
+  
+  tau_grid[which(error_vals < eps_target)[1]]
+}
+
+window_len <- 252
+horizon <- 63
+alphaCVaR <- 0.95
+Nsim <- 1000
+tau <- 20
+Kmax <- 10 * tau
+Nroll <- 4
+d <- length(symbols)
+
+weight_hist <- matrix(NA_real_, nrow = Nroll, ncol = d, dimnames = list(NULL, symbols))
+ret_hist <- numeric(Nroll)
+
+n_cores <- detectCores()
+cl <- makeCluster(n_cores)
+
+for (i in seq_len(Nroll)) {
+  t0 <- start_index + (i - 1) * horizon
+  win <- returns[(t0 - window_len):(t0 - 1), ]
+  
+  nig_marg <- lapply(symbols, function(sym) {
+    data <- coredata(win[, sym])
+    f <- nigFit(data[abs(data) > 0], alpha = 1, beta = 0, delta = 1, mu = 0, doplot = FALSE, silent = TRUE)
+    f@fit$estimate
+  })
+  names(nig_marg) <- symbols
+  
+  Uinv_win <- lapply(nig_marg, build_Uinv)
+  posProb_win <- sapply(nig_marg, function(p) 1 - pnig(0, alpha = p["alpha"], beta = p["beta"], delta = p["delta"], mu = p["mu"]))
+  
+  Gamma <- sapply(symbols, function(sym) {
+    xvec <- coredata(win[, sym])
+    pars <- nig_marg[[sym]][c("alpha", "beta", "delta")]
+    sapply(seq_along(xvec), function(k)
+      one_tail(abs(xvec[k]),
+               if (xvec[k] >= 0) "pos" else "neg",
+               pars["alpha"], pars["beta"], pars["delta"]))
+  })
+  Gamma[!is.finite(Gamma)] <- 0
+  tau <- select_optimal_tau(nig_marg, Uinv_win, eps_target = 0.01, method = "mean")
+  Umat <- pobs(Gamma, ties.method = "average")
+  
+  # Define the t-copula with placeholder correlation matrix
+  tcop <- tCopula(dim = d, df = 4, dispstr = "un", df.fixed = FALSE)
+  start_vals <- c(rep(0.1, d * (d - 1) / 2), 4)  # last one is df
+  
+  # Fit using maximum pseudo-likelihood
+  fitT <- fitCopula(tcop, Umat, method = "mpl", start = start_vals)
+  
+  # Extract parameters
+  cop_params <- coef(fitT)
+  rho <- cop_params[1:(length(cop_params) - 1)]
+  df_est <- cop_params[length(cop_params)]
+  
+  # Reconstruct copula for sampling
+  cop <- tCopula(param = rho, dim = d, df = df_est, dispstr = "un")
+  
+  get21 <- function() {
+    Z21 <- numeric(d)
+    for (day in 1:horizon) {
+      Z1 <- numeric(d)
+      Gii <- cumsum(rexp(Kmax))
+      for (k in seq_len(Kmax)) {
+        if (Gii[k] > tau) next
+        if (runif(1) > 1 / 252) next
+        Gij <- as.numeric(rCopula(1, cop))
+        abs_xk <- mapply(function(f, u) f(u), Uinv_win, Gij)
+        sign_xk <- ifelse(runif(d) < posProb_win, 1, -1)
+        Z1 <- Z1 + sign_xk * abs_xk
+      }
+      compA <- mapply(function(pars, f_Uinv) {
+        epsilon <- abs(f_Uinv(tau))
+        f <- function(x) x * levy_nig_safe(x, pars["alpha"], pars["beta"], pars["delta"])
+        A_pos <- hcubature(f, lowerLimit = 1e-10, upperLimit = epsilon)$integral
+        A_neg <- hcubature(f, lowerLimit = -epsilon, upperLimit = -1e-10)$integral
+        A_pos + A_neg
+      }, nig_marg, Uinv_win)
+      Z21 <- Z21 + (Z1 - (1 / 252) * compA)
+    }
+    Z21
+  }
+  
+  clusterExport(cl, varlist = c("get21", "Uinv_win", "posProb_win", "cop", "nig_marg", 
+                                "levy_nig_safe", "hcubature", "Kmax", "tau", "d", "horizon"))
+  clusterEvalQ(cl, { library(cubature); library(copula) })
+  
+  scen <- parLapply(cl, 1:Nsim, function(i) get21())
+  scen <- do.call(rbind, scen)
+  scen <- scen[complete.cases(scen), , drop = FALSE]
+  scen_xts <- xts::xts(scen, order.by = Sys.Date() + seq_len(nrow(scen)))
+  
+  portf_spec <- portfolio.spec(assets = colnames(scen_xts))
+  portf_spec <- add.constraint(portf_spec, type = "full_investment")
+  portf_spec <- add.constraint(portf_spec, type = "long_only")
+  portf_spec <- add.objective(portf_spec, type = "risk", name = "ES", arguments = list(p = 1 - alphaCVaR))
+  
+  opt_result <- optimize.portfolio(R = scen_xts, portfolio = portf_spec, optimize_method = "ROI")
+  w_t <- extractWeights(opt_result)
+  weight_hist[i, ] <- w_t
+  
+  realized <- colSums(returns[t0:(t0 + horizon - 1), ])
+  ret_hist[i] <- 100 * (exp(sum(w_t * realized)) - 1)
+}
+stopCluster(cl)
+roll_dates <- index(returns)[start_index + (0:(Nroll - 1)) * horizon]
+roll_labels <- format(roll_dates, "%Y-%m-%d")
+
+
+Cairo::CairoPNG("weight_plotkvartalTCopula.png", width = 800, height = 600)
+matplot(x = 1:Nroll, y = weight_hist, type = "l", lty = 1, col = 1:d,
+        xaxt = "n",
+        xlab = "Date", ylab = "Weight",
+        main = "95% CVaR-optimal Weights of Student's t-copula (63 days horizon)")
+axis(1, at = 1:Nroll, labels = roll_labels, las = 2, cex.axis = 0.8)
+legend("right", legend = symbols, col = 1:d, lty = 1, cex = 0.7)
+dev.off()
+
+Cairo::CairoPNG("portreturkvartal_plotTCopula.png", width = 800, height = 600)
+plot(x = 1:Nroll, y = ret_hist, type = "b", pch = 19, col = "blue",
+     xaxt = "n",
+     xlab = "Date", ylab = "Portolio return in percentage",
+     main = "Portfolio return of 63 days horizon with Student's t-copula")
+axis(1, at = 1:Nroll, labels = roll_labels, las = 2, cex.axis = 0.8)
+abline(h = 0, lty = 2)
+dev.off()
+
+
