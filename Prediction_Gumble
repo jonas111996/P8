@@ -190,30 +190,47 @@ for (i in seq_len(Nroll)) {
   w_t <- extractWeights(opt_result)
   weight_hist[i, ] <- w_t
   
-  realized <- colSums(returns[t0:(t0 + horizon - 1), ])
-  ret_hist[i] <- 100 * (exp(sum(w_t * realized)) - 1)
+  daily_returns <- returns[t0:(t0 + horizon - 1), ]
+  portf_daily_ret <- xts::xts(as.numeric(daily_returns %*% w_t), order.by = index(daily_returns))
+  
+  # Save the 63-day daily returns into a full series
+  if (i == 1) {
+    full_daily_ret <- portf_daily_ret
+  } else {
+    full_daily_ret <- rbind(full_daily_ret, portf_daily_ret)
+  }
+  
+  # Also compute and store the total 63-day return (as before)
+  ret_hist[i] <- 100 * (exp(sum(portf_daily_ret)) - 1)
 }
 stopCluster(cl)
 roll_dates <- index(returns)[start_index + (0:(Nroll - 1)) * horizon]
 roll_labels <- format(roll_dates, "%Y-%m-%d")
 
-Cairo::CairoPNG("weight_plotdag.png", width = 800, height = 600)
-matplot(x = 1:Nroll, y = weight_hist, type = "l", lty = 1, col = 1:d,
-        xaxt = "n",  # suppress default x-axis
+
+
+Cairo::CairoPNG("weight_plotkvartalTCopula.png", width = 800, height = 600)
+matplot(x = roll_dates, y = weight_hist, type = "l", lty = 1, col = 1:d,
+        xaxt = "n",
         xlab = "Date", ylab = "Weight",
-        main = "95% CVaR-optimal Weights of Gumbel copula (1-day horizon)")
-axis(1, at = 1:Nroll, labels = roll_labels, las = 2, cex.axis = 0.8)  # add custom x-axis
-legend("right", legend = symbols, col = 1:d, lty = 1, cex = 0.7)
+        main = "95% CVaR-optimal Weights of Student's t-copula (63 days horizon)")
+tick_locs <- seq(from = min(roll_dates), to = max(roll_dates), by = "3 months")
+axis(1, at = tick_locs, labels = format(tick_locs, "%b %Y"))
+legend("topright", legend = symbols, col = 1:d, lty = 1, cex = 0.8)
 dev.off()
 
-Cairo::CairoPNG("portreturnday_plot.png", width = 800, height = 600)
-plot(x = 1:Nroll, y = ret_hist, type = "b", pch = 19, col = "blue",
+Cairo::CairoPNG("Portreturnkvartal_Tcopula.png", width = 800, height = 600)
+plot(index(full_daily_ret), 100 * (exp(cumsum(full_daily_ret)) - 1), type = "l", col = "darkgreen",
      xaxt = "n",
-     xlab = "Date", ylab = "Portolio return in percentage",
-     main = "Portfolio return of 1-day horizon with Gumbel copula")
-axis(1, at = 1:Nroll, labels = roll_labels, las = 2, cex.axis = 0.8)
+     xlab = "Date", ylab = "Cumulative return (%)",
+     main = "Cumulative 63-day horizon portfolio return with Student's t-copula")
+tick_locs_ret <- seq(from = min(index(full_daily_ret)), to = max(index(full_daily_ret)), by = "3 month")
+axis(1, at = tick_locs_ret, labels = format(tick_locs_ret, "%b %Y"))
 abline(h = 0, lty = 2)
 dev.off()
+
+
+
 
 
 
