@@ -1,10 +1,10 @@
+# Updated R script with trading day alignment
 
-
-library(quantmod)    # for getSymbols, dailyReturn
-library(ghyp)        # for pnig
-library(copula)      # for archmCopula, fitCopula, pobs
-library(cubature)    # for hcubature
-library(Rglpk)       # for Rglpk_solve_LP
+library(quantmod)
+library(ghyp)
+library(copula)
+library(cubature)
+library(Rglpk)
 library(fBasics)
 library(PortfolioAnalytics)
 library(ROI)
@@ -13,8 +13,7 @@ library(parallel)
 
 set.seed(123)
 
-symbols <- c("AAPL","NFLX","TSLA","MSFT",
-             "PFE","JPM","MS","F")
+symbols <- c("AAPL","NFLX","TSLA","MSFT","PFE","JPM","MS","F")
 
 get_returns <- function(sym, from = "2013-01-01", to = "2016-12-31") {
   dat <- getSymbols(sym, src = "yahoo", from = from, to = to, auto.assign = FALSE)
@@ -27,18 +26,13 @@ returns <- do.call(merge, returns_list)
 colnames(returns) <- symbols
 returns <- na.omit(returns)
 
-# Start the rolling window at 31-Dec-2015
 start_date <- as.Date("2015-12-31")
 start_index <- which(index(returns) == start_date)
 stopifnot(start_index >= 252)
 
-
-
 levy_nig_safe <- function(x, alpha, beta, delta, eps = 1e-10) {
   x2 <- ifelse(abs(x) < eps, sign(x) * eps, x)
-  v <- delta * alpha / pi *
-    exp(beta * x2) *
-    besselK(alpha * abs(x2), 1, expon.scaled = TRUE) / abs(x2)
+  v <- delta * alpha / pi * exp(beta * x2) * besselK(alpha * abs(x2), 1, expon.scaled = TRUE) / abs(x2)
   v[!is.finite(v)] <- 0
   v
 }
@@ -77,7 +71,6 @@ Finv_Gumbel <- function(xi, v, theta, eta = 1e-12) {
 
 select_optimal_tau <- function(nig_marg, Uinv_list, tau_grid = seq(10, 200, by = 10), eps_target = 0.01, method = c("mean", "max")) {
   method <- match.arg(method)
-  
   compute_Aj <- function(pars, f_Uinv, tau) {
     epsilon <- abs(f_Uinv(tau))
     f <- function(x) x * levy_nig_safe(x, pars["alpha"], pars["beta"], pars["delta"])
@@ -85,34 +78,30 @@ select_optimal_tau <- function(nig_marg, Uinv_list, tau_grid = seq(10, 200, by =
     A_neg <- hcubature(f, lowerLimit = -epsilon, upperLimit = -1e-10)$integral
     A_pos + A_neg
   }
-  
   error_vals <- sapply(tau_grid, function(tau) {
     A_vals <- mapply(compute_Aj, nig_marg, Uinv_list, MoreArgs = list(tau = tau))
     if (method == "mean") mean(A_vals) else max(A_vals)
   })
-  
   if (all(error_vals > eps_target)) {
     warning("No tau satisfies the error threshold. Returning largest tau.")
     return(tau_grid[which.min(error_vals)])
   }
-  
   tau_grid[which(error_vals < eps_target)[1]]
 }
 
 window_len <- 252
-horizon <- 1
+horizon <- 63
 alphaCVaR <- 0.95
 Nsim <- 1000
-tau <- 20
+tau <- 200
 Kmax <- 10 * tau
-Nroll <- 30
+Nroll <- 4
 d <- length(symbols)
 
 weight_hist <- matrix(NA_real_, nrow = Nroll, ncol = d, dimnames = list(NULL, symbols))
 ret_hist <- numeric(Nroll)
 theta_hist <- numeric(Nroll)
 
-# Opret parallel cluster
 n_cores <- detectCores()
 cl <- makeCluster(n_cores)
 
@@ -134,9 +123,7 @@ for (i in seq_len(Nroll)) {
     xvec <- coredata(win[, sym])
     pars <- nig_marg[[sym]][c("alpha", "beta", "delta")]
     sapply(seq_along(xvec), function(k)
-      one_tail(abs(xvec[k]),
-               if (xvec[k] >= 0) "pos" else "neg",
-               pars["alpha"], pars["beta"], pars["delta"]))
+      one_tail(abs(xvec[k]), if (xvec[k] >= 0) "pos" else "neg", pars["alpha"], pars["beta"], pars["delta"]))
   })
   Gamma[!is.finite(Gamma)] <- 0
   tau <- select_optimal_tau(nig_marg, Uinv_win, eps_target = 0.01, method = "mean")
@@ -179,7 +166,13 @@ for (i in seq_len(Nroll)) {
   scen <- parLapply(cl, 1:Nsim, function(i) get21())
   scen <- do.call(rbind, scen)
   scen <- scen[complete.cases(scen), , drop = FALSE]
-  scen_xts <- xts::xts(scen, order.by = Sys.Date() + seq_len(nrow(scen)))
+  available_dates <- index(returns)
+  end_index <- min(t0 + nrow(scen) - 1, length(available_dates))
+  sim_dates <- available_dates[t0:end_index]
+  
+  # Truncate scen matrix to match sim_dates if necessary
+  scen <- scen[seq_len(length(sim_dates)), , drop = FALSE]
+  scen_xts <- xts::xts(scen, order.by = sim_dates)
   
   portf_spec <- portfolio.spec(assets = colnames(scen_xts))
   portf_spec <- add.constraint(portf_spec, type = "full_investment")
@@ -193,42 +186,40 @@ for (i in seq_len(Nroll)) {
   daily_returns <- returns[t0:(t0 + horizon - 1), ]
   portf_daily_ret <- xts::xts(as.numeric(daily_returns %*% w_t), order.by = index(daily_returns))
   
-  # Save the 63-day daily returns into a full series
   if (i == 1) {
     full_daily_ret <- portf_daily_ret
   } else {
     full_daily_ret <- rbind(full_daily_ret, portf_daily_ret)
   }
-  
-  # Also compute and store the total 63-day return (as before)
   ret_hist[i] <- 100 * (exp(sum(portf_daily_ret)) - 1)
 }
 stopCluster(cl)
+
+
+print(returns)
+
 roll_dates <- index(returns)[start_index + (0:(Nroll - 1)) * horizon]
-roll_labels <- format(roll_dates, "%Y-%m-%d")
+print(roll_dates)
 
 
-
-Cairo::CairoPNG("weight_plotkvartalTCopula.png", width = 800, height = 600)
+Cairo::CairoPNG("weight_QuatarGumble1.png", width = 800, height = 600)
 matplot(x = roll_dates, y = weight_hist, type = "l", lty = 1, col = 1:d,
-        xaxt = "n",
-        xlab = "Date", ylab = "Weight",
-        main = "95% CVaR-optimal Weights of Student's t-copula (63 days horizon)")
+        xaxt = "n", xlab = "Date", ylab = "Weight",
+        main = "95% CVaR-optimal Weights of Levy Gumbel copula (63 day horizon)")
 tick_locs <- seq(from = min(roll_dates), to = max(roll_dates), by = "3 months")
 axis(1, at = tick_locs, labels = format(tick_locs, "%b %Y"))
 legend("topright", legend = symbols, col = 1:d, lty = 1, cex = 0.8)
 dev.off()
 
-Cairo::CairoPNG("Portreturnkvartal_Tcopula.png", width = 800, height = 600)
+
+Cairo::CairoPNG("PortreturnQuatar1_Gymbel.png", width = 800, height = 600)
 plot(index(full_daily_ret), 100 * (exp(cumsum(full_daily_ret)) - 1), type = "l", col = "darkgreen",
-     xaxt = "n",
-     xlab = "Date", ylab = "Cumulative return (%)",
-     main = "Cumulative 63-day horizon portfolio return with Student's t-copula")
+     xaxt = "n", xlab = "Date", ylab = "Cumulative return (%)",
+     main = "Cumulative 63-day horizon portfolio return with Gumbel's copula")
 tick_locs_ret <- seq(from = min(index(full_daily_ret)), to = max(index(full_daily_ret)), by = "3 month")
 axis(1, at = tick_locs_ret, labels = format(tick_locs_ret, "%b %Y"))
 abline(h = 0, lty = 2)
 dev.off()
-
 
 
 
