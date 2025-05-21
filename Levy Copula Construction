@@ -1,0 +1,148 @@
+# --- Load required packages ---
+library(quantmod)
+library(ghyp)
+library(copula)
+library(fBasics)
+library(cubature)
+library(gofCopula)
+symbols <- c("AAPL", "NFLX", "TSLA", "MSFT",
+             "PFE", "JPM", "MS", "F")
+
+install.packages("gofCopula")
+
+# === 2. Download daily log returns ===
+get_returns <- function(sym) {
+  data <- getSymbols(sym, src = "yahoo", from = "2015-01-02", to = "2015-12-31", auto.assign = FALSE)
+  close_prices <- Ad(data)
+  dailyReturn(close_prices, type = "log")
+}
+
+
+returns_list <- lapply(symbols, get_returns)
+returns <- na.omit(do.call(merge, returns_list))
+colnames(returns) <- symbols
+
+
+
+# --- Set jump threshold ---
+epsilon <- 0.00000
+
+# --- Step 1: Fit NIG marginals to large jumps ---
+nig_marginals <- list()
+
+for (i in symbols) {
+  cat("Fitting NIG for", i, "\n")
+  
+  jump_data <- coredata(returns[, i])
+  jump_data <- jump_data[abs(jump_data) > epsilon]
+  
+  fit <- nigFit(jump_data, alpha = 1, beta = 0, delta = 1, mu=0, doplot = FALSE, silent = TRUE)
+  nig_marginals[[i]] <- fit@fit$estimate
+}
+
+cat("\n--- Marginal NIG Parameters ---\n")
+print(nig_marginals)
+
+
+alpha_apple  <- nig_marginals$AAPL[["alpha"]]
+beta_apple   <- nig_marginals$AAPL[["beta"]]
+delta_apple  <- nig_marginals$AAPL[["delta"]]
+
+alpha_netflix  <- nig_marginals$NFLX[["alpha"]]
+beta_netflix   <- nig_marginals$NFLX[["beta"]]
+delta_netflix  <- nig_marginals$NFLX[["delta"]]
+
+
+alpha_tesla  <- nig_marginals$TSLA[["alpha"]]
+beta_tesla   <- nig_marginals$TSLA[["beta"]]
+delta_tesla  <- nig_marginals$TSLA[["delta"]]
+
+
+levy_nig <- function(x, alpha, beta, delta){
+  const <- delta * alpha / pi
+  const * exp(beta * x) * besselK(alpha * abs(x), nu = 1) / abs(x)
+}
+
+
+
+levy_tail <- function(z, side = "pos", alpha, beta, delta){
+  f <- function(x) levy_nig(x, alpha, beta, delta)
+  if(side == "pos") hcubature(f, lowerLimit = z, upperLimit = Inf)$integral
+  else              hcubature(f, lowerLimit = -Inf, upperLimit = -z)$integral
+}
+
+z  <- 5e-4
+tp_apple <- levy_tail(z, "pos",  alpha_apple, beta_apple, delta_apple)
+tn_apple <- levy_tail(z, "neg",  alpha_apple, beta_apple, delta_apple)
+
+tp_netflix <- levy_tail(z, "pos",  alpha_netflix, beta_netflix, delta_netflix)
+tn_netflix <- levy_tail(z, "neg",  alpha_netflix, beta_netflix, delta_netflix)
+
+tp_tesla <- levy_tail(z, "pos",  alpha_tesla, beta_tesla, delta_tesla)
+tn_tesla <- levy_tail(z, "neg",  alpha_tesla, beta_tesla, delta_tesla)
+
+print(tp_tesla)
+print(tn_tesla)
+
+
+# helper: one–jump tail integral -----------------------------------
+one_tail <- function(ax, sgn, pars)
+{
+  if (sgn)            # positive jump
+    levy_tail(ax, "pos", pars["alpha"], pars["beta"], pars["delta"])
+  else                # negative jump
+    levy_tail(ax, "neg", pars["alpha"], pars["beta"], pars["delta"])
+}
+
+Gamma <- matrix(NA_real_, nrow = nrow(returns), ncol = length(symbols),
+                dimnames = list(index(returns), symbols))
+
+for (sym in symbols) {
+  pars <- nig_marginals[[sym]][c("alpha", "beta", "delta")]
+  xvec <- coredata(returns[, sym])
+  absx <- abs(xvec)
+  pos  <- xvec >= 0
+  
+  gamma_col <- numeric(length(absx))       # pre-allocate
+  
+  keep <- absx > epsilon                   # only the “real” jumps
+  if (any(keep)) {
+    ## mapply calls one_tail() once per jump that we keep
+    gamma_col[keep] <- mapply(one_tail,
+                              ax   = absx[keep],
+                              sgn  = pos [keep],
+                              MoreArgs = list(pars = pars))
+  }
+  gamma_col[!is.finite(gamma_col)] <- 0     # NA / Inf guard
+  Gamma[, sym] <- gamma_col
+}
+Gamma_df <- as.data.frame(Gamma)
+Gamma_df <- Gamma_df[rowSums(Gamma_df) > 0, ]
+U <- pobs(Gamma, ties.method="average")
+
+
+## ------------------------------------------------------------------
+## ------------------------------------------------------------------
+const_col <- apply(U, 2, function(v) length(unique(v)) < 2)
+if(any(const_col)){
+  message("Dropping constant columns: ",
+          paste(names(U)[const_col], collapse = ", "))
+  U <- U[, !const_col, drop = FALSE]
+}
+## ------------------------------------------------------------------
+## 6  Fit an 8-dimensional Clayton, Gumble and t-copula Lévy copula  ---------------------
+## ------------------------------------------------------------------
+startCop <- archmCopula("clayton", dim = ncol(U), param = 1)
+Gumbel <- archmCopula("gumbel", dim = ncol(U))
+tcop <- tCopula(dim = 8, df=4, df.fixed = TRUE)
+fitClay  <- fitCopula(startCop, U, method = "mpl")  # or method = "ml"
+fitGumbel <- fitCopula(Gumbel, U, method = "mpl")
+fit_tcop <- fitCopula(tcop, U, method = "mpl")
+
+
+tCop <- tCopula(dim       = ncol(U),     # same dimension as U
+                dispstr   = "ex",        # unrestricted correlation matrix
+                df        = 4,           # starting value
+                df.fixed  = TRUE)       # estimate df as well
+fitT  <- fitCopula(tCop,  U, method = "mpl")
+summary(fitT)
