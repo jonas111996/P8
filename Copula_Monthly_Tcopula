@@ -1,0 +1,145 @@
+# Rolling Monthly Rebalancing via Student-t Copula for 2016
+library(robustbase)
+library(quantmod)
+library(PerformanceAnalytics)
+library(PortfolioAnalytics)
+library(DEoptim)
+library(ROI)
+library(ROI.plugin.quadprog)
+library(nloptr)
+library(copula)
+library(ggplot2)
+library(reshape2)
+
+set.seed(123)
+
+#Negative log-likelihood for Student-t (location-scale)
+nll_t <- function(par, x) {
+  mu    <- par[1]
+  sigma <- par[2]
+  df    <- par[3]
+  if (sigma <= 0 || df <= 2) return(1e10)
+  z <- (x - mu) / sigma
+  -sum(dt(z, df = df, log = TRUE) - log(sigma))
+}
+
+#Data acquisition & log-return calculation
+symbols <- c("NFLX","AAPL","TSLA","PFE","MSFT","JPM","MS","F")
+getSymbols(symbols, src = "yahoo",
+           from = "2013-01-01", to = "2016-12-31")
+
+# daily log-returns with outlier filtering
+rets_list <- lapply(symbols, function(sym) {
+  dailyReturn(Ad(get(sym)), type = "log")
+})
+
+returns_all  <- na.omit(do.call(merge, rets_list))
+colnames(returns_all) <- symbols
+returns_2016 <- returns_all["2016-01-01/2016-12-31"]
+
+#Rolling Window Forecasting (252-day window, 1-month ahead, monthly rebalance)
+window_size      <- 252    # ~1 year of trading days
+forecast_horizon <- 21     # ~1 month ≈21 trading days
+
+#Compute month-end on full series, then shift +1 to get first trading day of each month
+all_month_ends    <- endpoints(returns_all, on = "months")
+month_starts_idx  <- all_month_ends + 1
+
+#Filter to Jan–Dec 2016 and ensure full window and valid index
+valid_starts <- month_starts_idx[
+  (month_starts_idx > window_size) &
+    (month_starts_idx + forecast_horizon <= nrow(returns_all)) &
+    (index(returns_all)[month_starts_idx] >= as.Date("2016-01-01")) &
+    (index(returns_all)[month_starts_idx] <= as.Date("2016-12-31"))
+]
+
+#Display the rebalance dates
+print(index(returns_all)[valid_starts])
+
+#Portfolio spec
+portf_spec <- portfolio.spec(assets = symbols) %>%
+  add.constraint(type = "full_investment") %>%
+  add.constraint(type = "long_only") %>%
+  add.objective(type = "return", name = "mean") %>%
+  add.objective(type = "risk",   name = "CVaR", arguments = list(p = 0.95))
+
+optimized_weights_list <- list()
+
+for (t0 in valid_starts) {
+  train_end <- t0 - 1
+  win       <- returns_all[(train_end - window_size + 1):train_end, ]
+  fit_params <- do.call(rbind, lapply(seq_along(symbols), function(i) {
+    x    <- coredata(win[,i])
+    init <- c(mean(x), sd(x), 5)
+    opt  <- optim(init, nll_t, x = x, method = "L-BFGS-B",
+                  lower = c(-Inf,1e-6,2.1), upper = c(Inf,Inf,200))
+    unname(opt$par)
+  }))
+  colnames(fit_params) <- c("mu","sigma","df")
+  rownames(fit_params) <- symbols
+  
+
+  U_mat <- do.call(cbind, lapply(seq_along(symbols), function(i) {
+    df <- fit_params[i,"df"]
+    m  <- fit_params[i,"mu"]
+    s  <- fit_params[i,"sigma"]
+    as.numeric(pt((win[,i] - m)/s, df = df))
+  }))
+  colnames(U_mat) <- symbols
+  
+  #Fit t-copula & simulate
+  tcop     <- tCopula(dim = ncol(U_mat), df = 4, df.fixed = TRUE)
+  fit_tcop <- fitCopula(tcop, data = U_mat, method = "mpl")
+  set.seed(123); Nsim <- 1000
+  U_sim <- rCopula(Nsim, fit_tcop@copula)
+  R_sim <- do.call(cbind, lapply(seq_along(symbols), function(i) {
+    df <- fit_params[i,"df"]
+    m  <- fit_params[i,"mu"]
+    s  <- fit_params[i,"sigma"]
+    as.numeric(m + s * qt(U_sim[,i], df = df))
+  }))
+  colnames(R_sim) <- symbols
+  
+  w_date   <- index(returns_all)[t0]
+  R_xts    <- xts(R_sim, order.by = rep(w_date, Nsim))
+  
+  #Optimize weights using CVaR for that simulated month
+  opt <- optimize.portfolio(
+    R               = R_xts,
+    portfolio       = portf_spec,
+    optimize_method = "ROI",
+    trace           = FALSE
+  )
+  optimized_weights_list[[ as.character(w_date) ]] <- extractWeights(opt)
+}
+
+#Compute returns and analyze
+weights_df  <- do.call(rbind, optimized_weights_list)
+weights_xts <- xts(weights_df, order.by = as.Date(rownames(weights_df)))
+
+portfolio_returns <- Return.portfolio(
+  R            = returns_2016,
+  weights      = weights_xts,
+  rebalance_on = "months"
+)
+
+cum_rets <- cumprod(1 + portfolio_returns) - 1
+sr       <- SharpeRatio.annualized(portfolio_returns, Rf = 0)
+md       <- maxDrawdown(portfolio_returns)
+
+cat("2016 Cumulative Return:       ", round(last(cum_rets), 4), "\n")
+cat("2016 Annualized Sharpe Ratio: ", round(sr, 4),        "\n")
+cat("2016 Maximum Drawdown:        ", round(md, 4),        "\n")
+
+#Plot weight evolution
+wm <- melt(
+  data.frame(Date = index(weights_xts), coredata(weights_xts)),
+  id.vars = "Date"
+)
+ggplot(wm, aes(x = Date, y = value, color = variable)) +
+  geom_line() +
+  labs(x = "Date", y = "Weight", color = "Asset") +
+  theme_minimal()
+
+#Plot cumulative returns
+plot(cum_rets, main = "")
