@@ -1,0 +1,121 @@
+#Rolling Monthly Rebalancing with Monthly Forecast Horizon for 2016
+library(robustbase)
+library(quantmod)
+library(PerformanceAnalytics)
+library(PortfolioAnalytics)
+library(DEoptim)
+library(ROI)
+library(ROI.plugin.quadprog)
+library(nloptr)
+library(copula)
+library(ghyp)
+library(pbapply)
+library(ggplot2)
+library(reshape2)
+
+set.seed(123)
+
+#Data acquisition & log-return calculation
+symbols <- c("NFLX", "AAPL", "TSLA", "PFE", "MSFT", "JPM", "MS", "F")
+getSymbols(symbols, src = "yahoo", from = "2013-01-01", to = "2016-12-31")
+
+#Compute daily log-returns
+rets_list <- lapply(symbols, function(sym) {
+  dailyReturn(Ad(get(sym)), type = "log")
+})
+returns <- na.omit(do.call(merge, rets_list))
+colnames(returns) <- symbols
+
+#Rolling Monthly Forecasts
+window_size      <- 252
+forecast_horizon <- 21
+all_dates        <- index(returns)
+
+#Get first trading days of each month in 2016
+month_ends <- endpoints(returns, on = "months")
+month_starts_idx <- month_ends + 1
+
+#Filter for 2016 starts that allow full window and forecast
+month_starts_idx <- month_starts_idx[
+  month_starts_idx > window_size &
+    month_starts_idx + forecast_horizon <= nrow(returns) &
+    index(returns)[month_starts_idx] >= as.Date("2016-01-01") &
+    index(returns)[month_starts_idx] <= as.Date("2016-12-01")
+]
+
+optimized_weights_list <- list()
+
+for (t0 in month_starts_idx) {
+  train_end <- t0 - 1
+  returns_train <- returns[(train_end - window_size + 1):train_end, ]
+  
+  #Fit NIG marginals
+  nig_fits <- lapply(as.list(data.frame(returns_train)), function(x) nigFit(x, printOut = FALSE))
+  params   <- do.call(cbind, lapply(nig_fits, function(f) f@fit$par))
+  rownames(params) <- c("alpha", "beta", "delta", "mu")
+  
+  U <- sapply(seq_along(symbols), function(i) {
+    pnig(q = as.numeric(returns_train[, i]),
+         mu = params["mu", i], delta = params["delta", i],
+         alpha = params["alpha", i], beta = params["beta", i])
+  })
+  colnames(U) <- symbols
+  
+  #Fit t-copula
+  cop_spec <- tCopula(dim = ncol(U), df = 4, df.fixed = TRUE)
+  fit_cop  <- fitCopula(cop_spec, data = U, method = "mpl")
+  
+  #Simulate future scenarios
+  Nsim <- 1000
+  U_sim <- rCopula(Nsim, fit_cop@copula)
+  R_sim <- sapply(seq_along(symbols), function(i) {
+    qnig(p = U_sim[, i],
+         mu = params["mu", i], delta = params["delta", i],
+         alpha = params["alpha", i], beta = params["beta", i])
+  })
+  colnames(R_sim) <- symbols
+  
+  sim_date <- index(returns)[t0]
+  R_sim_xts <- xts(R_sim, order.by = rep(sim_date, Nsim))
+  
+  #Portfolio specification
+  portf <- portfolio.spec(assets = symbols)
+  portf <- add.constraint(portf, type = "full_investment")
+  portf <- add.constraint(portf, type = "long_only")
+  portf <- add.objective(portf, type = "return", name = "mean")
+  portf <- add.objective(portf, type = "risk", name = "CVaR", arguments = list(p = 0.95))
+  
+  #Optimize
+  opt <- optimize.portfolio(R = R_sim_xts, portfolio = portf, optimize_method = "ROI", trace = FALSE)
+  w <- extractWeights(opt)
+  optimized_weights_list[[as.character(sim_date)]] <- w
+}
+
+#Results Analysis
+weights_df  <- do.call(rbind, optimized_weights_list)
+weights_xts <- xts(weights_df, order.by = as.Date(rownames(weights_df)))
+
+#Compute returns
+returns_2016 <- returns["2016-01-01/2016-12-31"]
+portfolio_returns <- Return.portfolio(R = returns_2016, weights = weights_xts, rebalance_on = "months")
+
+cumulative_returns <- cumprod(1 + portfolio_returns) - 1
+sharpe_ratio       <- SharpeRatio.annualized(portfolio_returns, Rf = 0)
+max_drawdown       <- maxDrawdown(portfolio_returns)
+
+cat("Portfolio Performance Metrics (Monthly Rebalancing @ Start):\n")
+cat("Cumulative Return:       ", round(last(cumulative_returns), 4), "\n")
+cat("Annualized Sharpe Ratio: ", round(sharpe_ratio, 4), "\n")
+cat("Maximum Drawdown:        ", round(max_drawdown, 4), "\n")
+
+#Plotting
+weights_melted <- melt(data.frame(Date = index(weights_xts), coredata(weights_xts)), id.vars = "Date")
+
+ggplot(weights_melted, aes(x = Date, y = value, color = variable)) +
+  geom_line() +
+  labs(x = "Date", y = "Weight", color = "Asset") +
+  theme_minimal()
+
+#Cumulative return
+plot(cumulative_returns, main ="")
+grid()
